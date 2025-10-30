@@ -1,0 +1,226 @@
+// Mood LED with alarm at mood==0 and rainbow when mood>=30
+// R/G/B -> RED_PIN/GREEN_PIN/BLUE_PIN through resistors
+// Button -> BUTTON_PIN with INPUT_PULLUP (pressed = LOW)
+
+const int RED_PIN    = 9;   // PWM
+const int GREEN_PIN  = 10;  // PWM
+const int BLUE_PIN   = 11;  // PWM
+const int BUTTON_PIN = 2;   // INPUT_PULLUP
+
+int mood = 10;             // start at 10 (green)
+const int MOOD_MIN = 0;
+const int MOOD_MAX = 30;
+
+const bool COMMON_ANODE = false; // set true if your LED is common anode
+
+// Timing for mood decay and debounce
+unsigned long lastPressMillis = 0;
+unsigned long lastDecayTick = 0;
+const unsigned long DECAY_START_MS = 5000UL; // 5 seconds
+const unsigned long ONE_SECOND = 1000UL;
+const unsigned long DEBOUNCE_MS = 50;
+
+// Button debounce state
+bool lastButtonStable = HIGH;
+unsigned long lastButtonChange = 0;
+
+// Smooth transition state
+float curR = 0, curG = 0, curB = 0; // 0..255
+const float SMOOTH_FACTOR = 0.12f;   // 0.02 very smooth, 0.2 faster
+
+// Rainbow effect state (used when mood >= MOOD_MAX)
+float rainbowPhase = 0.0f;            // cycles over time
+const float RAINBOW_SPEED = 0.8f;     // cycles per second
+
+// Alarm (mood==0) blinking state
+bool alarmOn = false;
+unsigned long lastAlarmToggle = 0;
+const unsigned long ALARM_PERIOD_MS = 500UL; // blink interval (ms)
+
+void setup() {
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  lastPressMillis = millis();
+  lastDecayTick = millis();
+
+  int r0, g0, b0;
+  moodToColor(mood, r0, g0, b0);
+  curR = r0; curG = g0; curB = b0;
+  applyPWM((int)curR, (int)curG, (int)curB);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Debounce + single-press detection
+  bool raw = digitalRead(BUTTON_PIN);
+  if (raw != lastButtonStable) {
+    lastButtonChange = now;
+    lastButtonStable = raw;
+  }
+  if (now - lastButtonChange > DEBOUNCE_MS) {
+    if (raw == LOW) { // pressed
+      mood++;
+      if (mood > MOOD_MAX) mood = MOOD_MAX;
+      lastPressMillis = now;
+      lastDecayTick = lastPressMillis;
+      // wait until release to avoid multiple increments
+      while (digitalRead(BUTTON_PIN) == LOW) delay(5);
+      lastButtonStable = HIGH;
+      lastButtonChange = millis();
+    }
+  }
+
+  // Decay logic: after 5s, decrease mood by 1 per second
+  if (now - lastPressMillis > DECAY_START_MS) {
+    if (now - lastDecayTick >= ONE_SECOND) {
+      unsigned long seconds = (now - lastDecayTick) / ONE_SECOND;
+      if (seconds > 0) {
+        mood -= (int)seconds;
+        lastDecayTick += seconds * ONE_SECOND;
+        if (mood < MOOD_MIN) mood = MOOD_MIN;
+      }
+    }
+  } else {
+    lastDecayTick = now;
+  }
+
+  // If mood == 0 -> alarm blinking (non-blocking)
+  if (mood == 0) {
+    if (now - lastAlarmToggle >= ALARM_PERIOD_MS) {
+      lastAlarmToggle = now;
+      alarmOn = !alarmOn;
+    }
+    if (alarmOn) {
+      // red on
+      smoothToImmediate(255, 0, 0); // jump to red for clearer alarm; smoothing still applied
+    } else {
+      // off (black)
+      smoothToImmediate(0, 0, 0);
+    }
+    applyPWM((int)curR, (int)curG, (int)curB);
+    delay(10);
+    return;
+  }
+
+  // If mood reached max (>= MOOD_MAX) run rainbow effect
+  if (mood >= MOOD_MAX) {
+    // advance rainbow phase based on elapsed time
+    static unsigned long lastRainbowMillis = 0;
+    unsigned long delta = now - lastRainbowMillis;
+    if (lastRainbowMillis == 0) lastRainbowMillis = now;
+    if (delta > 0) {
+      rainbowPhase += (RAINBOW_SPEED * delta) / 1000.0f; // increment cycles
+      lastRainbowMillis = now;
+    }
+    // wrap phase to 0..1
+    if (rainbowPhase >= 1.0f) rainbowPhase -= floor(rainbowPhase);
+
+    int tr, tg, tb;
+    hsvToRgb(rainbowPhase * 360.0f, 1.0f, 1.0f, tr, tg, tb); // full saturation/value
+    // smooth transition to rainbow color
+    curR += (tr - curR) * SMOOTH_FACTOR;
+    curG += (tg - curG) * SMOOTH_FACTOR;
+    curB += (tb - curB) * SMOOTH_FACTOR;
+    applyPWM((int)curR, (int)curG, (int)curB);
+    delay(10);
+    return;
+  }
+
+  // Normal mood color mapping and smoothing
+  int targetR, targetG, targetB;
+  moodToColor(mood, targetR, targetG, targetB);
+
+  curR += (targetR - curR) * SMOOTH_FACTOR;
+  curG += (targetG - curG) * SMOOTH_FACTOR;
+  curB += (targetB - curB) * SMOOTH_FACTOR;
+
+  applyPWM((int)curR, (int)curG, (int)curB);
+
+  delay(10);
+}
+
+// Helper to immediately set smoothing targets (used by alarm to jump to red/black)
+void smoothToImmediate(int rT, int gT, int bT) {
+  // make target values immediate by setting cur to target (or keep small smoothing)
+  // here we set cur directly for sharper blink; adjust if you prefer smoothing
+  curR = rT;
+  curG = gT;
+  curB = bT;
+}
+
+// Map mood [0..30] to color along two segments:
+// 0..10: red -> green
+// 10..30: green -> blue
+void moodToColor(int m, int &r, int &g, int &b) {
+  if (m <= MOOD_MIN) {
+    r = 255; g = 0; b = 0; // red at 0 (will be overridden by alarm blink)
+    return;
+  }
+  if (m >= MOOD_MAX) {
+    r = 0; g = 0; b = 255;
+    return;
+  }
+
+  if (m <= 10) {
+    float local = (float)(m - 0) / 10.0f; // 0..1
+    r = (int)(255.0f * (1.0f - local) + 0.5f);
+    g = (int)(255.0f * local + 0.5f);
+    b = 0;
+  } else {
+    float local = (float)(m - 10) / 20.0f; // 0..1 over 10..30
+    r = 0;
+    g = (int)(255.0f * (1.0f - local) + 0.5f);
+    b = (int)(255.0f * local + 0.5f);
+  }
+}
+
+// Convert HSV (h:0..360, s:0..1, v:0..1) to RGB 0..255
+void hsvToRgb(float h, float s, float v, int &outR, int &outG, int &outB) {
+  if (s <= 0.0f) {
+    int vi = (int)(v * 255.0f + 0.5f);
+    outR = outG = outB = vi;
+    return;
+  }
+  float hh = h;
+  if (hh >= 360.0f) hh = 0.0f;
+  hh /= 60.0f;
+  int i = (int)floor(hh);
+  float ff = hh - i;
+  float p = v * (1.0f - s);
+  float q = v * (1.0f - (s * ff));
+  float t = v * (1.0f - (s * (1.0f - ff)));
+  float r, g, b;
+  switch (i) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    case 5:
+    default: r = v; g = p; b = q; break;
+  }
+  outR = (int)(r * 255.0f + 0.5f);
+  outG = (int)(g * 255.0f + 0.5f);
+  outB = (int)(b * 255.0f + 0.5f);
+}
+
+// Write PWM values and handle common anode inversion
+void applyPWM(int r, int g, int bl) {
+  r = constrain(r, 0, 255);
+  g = constrain(g, 0, 255);
+  bl = constrain(bl, 0, 255);
+
+  if (COMMON_ANODE) {
+    analogWrite(RED_PIN, 255 - r);
+    analogWrite(GREEN_PIN, 255 - g);
+    analogWrite(BLUE_PIN, 255 - bl);
+  } else {
+    analogWrite(RED_PIN, r);
+    analogWrite(GREEN_PIN, g);
+    analogWrite(BLUE_PIN, bl);
+  }
+}
